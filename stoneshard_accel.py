@@ -293,6 +293,33 @@ class MODULEENTRY32W(ctypes.Structure):
     ]
 
 
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", ctypes.c_void_p),
+        ("AllocationBase", ctypes.c_void_p),
+        ("AllocationProtect", wt.DWORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", wt.DWORD),
+        ("Protect", wt.DWORD),
+        ("Type", wt.DWORD),
+    ]
+
+
+k32.VirtualQueryEx.argtypes = [wt.HANDLE, ctypes.c_void_p,
+                               ctypes.POINTER(MEMORY_BASIC_INFORMATION),
+                               ctypes.c_size_t]
+k32.VirtualQueryEx.restype = ctypes.c_size_t
+
+PAGE_NOACCESS = 0x01
+PAGE_READONLY = 0x02
+PAGE_WRITECOPY = 0x08
+PAGE_EXECUTE_READ = 0x20
+PAGE_EXECUTE_WRITECOPY = 0x80
+PAGE_GUARD = 0x100
+WRITABLE_PROTECT = (PAGE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_READWRITE,
+                    PAGE_EXECUTE_WRITECOPY)
+
+
 def qpc_now():
     v = ctypes.c_int64()
     k32.QueryPerformanceCounter(ctypes.byref(v))
@@ -971,6 +998,11 @@ def local_selftest(factor=2.0, log=print):
 # --------------------------------------------------------------------------
 # 洗点：直接改存档文件
 # --------------------------------------------------------------------------
+# 注意：这条路走不通！游戏对存档做了完整性校验（文件里的 32 位串不是常见的
+# md5/sha1/sha256/blake2 中的任何一种），自己改出来的存档会被判为"存档损坏"。
+# 下面这些代码保留着用于**读取**存档（拿角色当前数值），改数值请用内存方式
+# （见 AttrLocator），让游戏自己把新数值写回存档。
+
 # 存档格式（自己解出来的）：
 #     zlib( JSON 正文 )  +  32 位随机 ID  +  \0
 # 正文里 characterDataMap 就是玩家的角色数据，属性字段是 STR / AGL / PRC /
@@ -1134,6 +1166,132 @@ def _set_numbers(body, span, pairs):
     return body[:span[0]] + seg + body[span[1]:]
 
 
+def iter_regions(handle):
+    """遍历目标进程里所有已提交、可读的内存区域 -> (基址, 大小, 是否可写)"""
+    mbi = MEMORY_BASIC_INFORMATION()
+    addr = 0
+    limit = 0x7FFFFFFFFFFF
+    while addr < limit:
+        got = k32.VirtualQueryEx(handle, ctypes.c_void_p(addr),
+                                 ctypes.byref(mbi), ctypes.sizeof(mbi))
+        if not got:
+            break
+        base = int(mbi.BaseAddress or 0)
+        size = int(mbi.RegionSize)
+        if size <= 0:
+            break
+        prot = int(mbi.Protect)
+        if (int(mbi.State) == MEM_COMMIT and not (prot & PAGE_GUARD)
+                and not (prot & PAGE_NOACCESS)):
+            yield base, size, ((prot & 0xFF) in WRITABLE_PROTECT)
+        addr = base + size
+
+
+class AttrLocator:
+    """在游戏进程内存里定位角色属性数值（不碰存档文件）。
+
+    存档只用来"读出角色当前数值"，改数值全部在内存里做，游戏自己会写回存档，
+    这样就绕开了存档的完整性校验。
+    """
+
+    def __init__(self, pid=None, log=None):
+        self.log = log or (lambda m: None)
+        self.pid = pid or find_pid()
+        if not self.pid:
+            raise RuntimeError("游戏没在运行，请先启动游戏并读取角色")
+        self.h = k32.OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE
+            | PROCESS_VM_OPERATION, False, self.pid)
+        if not self.h:
+            err = ctypes.get_last_error()
+            tip = "（权限不足，试试用管理员身份运行）" if err == 5 else ""
+            raise RuntimeError("打开游戏进程失败，错误码 %d%s" % (err, tip))
+        self.mem = Mem(self.h)
+
+    def close(self):
+        if self.h:
+            k32.CloseHandle(self.h)
+        self.h = None
+
+    # ---------- 扫描 ----------
+
+    def scan(self, values, extra=(), radius=0x600, chunk=4 << 20):
+        """找形如 [STR, AGL, PRC, Vitality, WIL] 的连续 double。
+
+        values: 5 个属性值（从存档里读出来的）
+        extra : 其它已知数值（等级、经验、血蓝…），用来给候选打分
+        返回按可信度排序的候选列表。
+        """
+        vals = [float(v) for v in values]
+        pat = struct.pack("<d", vals[0])
+        extras = [struct.pack("<d", float(v)) for v in extra if float(v)]
+        hits = []
+        for base, size, writable in iter_regions(self.h):
+            off = 0
+            while off < size:
+                n = min(chunk, size - off)
+                try:
+                    buf = self.mem.read(base + off, n)
+                except OSError:
+                    off += n
+                    continue
+                pos = 0
+                while True:
+                    i = buf.find(pat, pos)
+                    if i < 0:
+                        break
+                    pos = i + 1
+                    addr = base + off + i
+                    for stride in (8, 16):
+                        ok = True
+                        for k in range(1, 5):
+                            p = i + k * stride
+                            try:
+                                if p + 8 <= len(buf):
+                                    v = struct.unpack_from("<d", buf, p)[0]
+                                else:
+                                    v = struct.unpack(
+                                        "<d", self.mem.read(addr + k * stride, 8))[0]
+                            except (OSError, struct.error):
+                                ok = False
+                                break
+                            if v != vals[k]:
+                                ok = False
+                                break
+                        if not ok:
+                            continue
+                        lo = max(0, i - radius)
+                        hi = min(len(buf), i + 5 * stride + radius)
+                        window = buf[lo:hi] if hi > lo else b""
+                        score = sum(1 for e in extras if e in window)
+                        hits.append({"addr": addr, "stride": stride, "score": score,
+                                     "writable": writable, "region": base,
+                                     "region_size": size})
+                off += n
+        hits.sort(key=lambda d: -d["score"])
+        return hits
+
+    def read_values(self, addr, stride, count=5):
+        return [struct.unpack("<d", self.mem.read(addr + i * stride, 8))[0]
+                for i in range(count)]
+
+    def write_values(self, addr, stride, values):
+        for i, v in enumerate(values):
+            self.mem.write(addr + i * stride, struct.pack("<d", float(v)))
+
+    def dump(self, addr, span=0x60):
+        """把某地址附近的 double 打出来，方便人工确认。"""
+        out = []
+        for o in range(0, span, 8):
+            try:
+                v = struct.unpack("<d", self.mem.read(addr + o, 8))[0]
+            except OSError:
+                break
+            if abs(v) < 1e6 and v == v:
+                out.append("%+.2f" % v)
+        return out
+
+
 def scan_characters():
     """扫描所有角色的存档，返回 [{角色, 存档槽, 姓名, 种族, 职业, 等级, 属性, AP, SP, 路径, 时间}]"""
     out = []
@@ -1179,6 +1337,11 @@ def scan_characters():
 
 class SaveEditor:
     """洗点 / 改点数：改动前自动备份整份存档目录。"""
+
+    SAVE_WRITE_DISABLED = (
+        "改存档这条路已经停用：实测游戏会对存档做完整性校验，改过的存档会被判为"
+        "「存档损坏」。请改用内存方式（界面上的洗点窗口选完后用内存洗点，或命令行 "
+        "--mem-scan / --mem-write），让游戏自己把新数值写回存档。")
 
     def __init__(self, log=None):
         self.log = log or (lambda m: None)
@@ -1245,6 +1408,8 @@ class SaveEditor:
 
     def respec_attrs(self, path, floor=ATTR_FLOOR, do_write=True):
         """属性洗点：五项属性回到 floor，省下的点数全部退回 AP。"""
+        if do_write:
+            raise RuntimeError(self.SAVE_WRITE_DISABLED)
         body, tail, obj = decode_save(path)
         c = obj["characterDataMap"]
         old = {k: float(c.get(k, 0.0)) for k, _cn in ATTRS}
@@ -1267,6 +1432,8 @@ class SaveEditor:
 
     def set_sp(self, path, value, do_write=True):
         """直接设定未分配的技能点（技能树已经学过的技能不会退掉）。"""
+        if do_write:
+            raise RuntimeError(self.SAVE_WRITE_DISABLED)
         body, tail, obj = decode_save(path)
         old = float(obj["characterDataMap"].get("SP", 0.0))
         span = player_span(body)
@@ -1284,6 +1451,8 @@ class SaveEditor:
         返还 N 点；职业初始自带的技能也会一起清掉并计入返还，这样你重新加回来
         不会亏（想换个流派也正好）。
         """
+        if do_write:
+            raise RuntimeError(self.SAVE_WRITE_DISABLED)
         body, tail, obj = decode_save(path)
         sdm = obj["skillsDataMap"]
         lst = sdm["skillsAllDataList"]
@@ -1346,7 +1515,8 @@ def respec_window(parent, log):
     rows = {}
     state = {"only_one": tk.BooleanVar(value=False)}
 
-    tk.Label(win, text="改存档前请先完全退出游戏，否则游戏会把改动覆盖掉。",
+    tk.Label(win, text="⚠ 改存档已停用：游戏会校验存档，改过的文件会被判为「存档损坏」。"
+                       "下面的列表只用来查看角色当前数值/备份；改数值请用内存方式。",
              fg="#a02000", font=("Microsoft YaHei UI", 9, "bold")).pack(
         anchor="w", padx=10, pady=(10, 4))
     tk.Label(win, text="属性洗点 = 五项属性回到下限、省下的点数全部退回 AP（属性点），"
@@ -1836,9 +2006,91 @@ def main(argv=None):
     ap.add_argument("--respec-restore", metavar="备份时间戳", help="从备份恢复存档")
     ap.add_argument("--respec-gui", action="store_true",
                     help="打开界面并直接弹出洗点窗口")
+    ap.add_argument("--mem-scan", metavar="角色[/存档槽] 或 属性值",
+                    help="在游戏内存里定位角色属性数值（例如 --mem-scan character_3）")
+    ap.add_argument("--mem-extra", metavar="数值列表", default="",
+                    help="扫描时用于加分的额外已知数值，如 25,4563")
+    ap.add_argument("--mem-write", metavar="地址:步长",
+                    help="把新属性写到指定地址（先用 --mem-scan 找到地址）")
+    ap.add_argument("--mem-attrs", metavar="力,敏,感,体,意",
+                    help="要写入的五项属性值")
+    ap.add_argument("--mem-dump", metavar="地址",
+                    help="打印该地址附近的数值，人工确认用")
     args = ap.parse_args(argv)
 
     log = lambda m: print(m, flush=True)
+
+    # ---------- 内存方式（不碰存档） ----------
+    if args.mem_dump:
+        loc = AttrLocator(log=log)
+        try:
+            addr = int(args.mem_dump, 0)
+            print("地址 %#x 附近的 8 字节浮点数：" % addr)
+            print("  " + "  ".join(loc.dump(addr)))
+        finally:
+            loc.close()
+        return 0
+
+    if args.mem_write:
+        loc = AttrLocator(log=log)
+        try:
+            addr_s, stride_s = args.mem_write.split(":")
+            addr, stride = int(addr_s, 0), int(stride_s)
+            if not args.mem_attrs:
+                print("要写属性就用 --mem-attrs 力,敏,感,体,意")
+                return 1
+            new = [float(x) for x in re.split(r"[,，]", args.mem_attrs) if x.strip()]
+            if len(new) != 5:
+                print("--mem-attrs 要正好 5 个数值")
+                return 1
+            old = loc.read_values(addr, stride)
+            print("写入前: %s" % "/".join("%g" % v for v in old))
+            loc.write_values(addr, stride, new)
+            now = loc.read_values(addr, stride)
+            print("写入后: %s" % "/".join("%g" % v for v in now))
+            print("现在切回游戏看看角色面板，数值应该已经变了。")
+        finally:
+            loc.close()
+        return 0
+
+    if args.mem_scan:
+        spec = args.mem_scan.strip()
+        extra = [float(x) for x in re.split(r"[,，]", args.mem_extra) if x.strip()]
+        if re.fullmatch(r"[\d.,，\s]+", spec):
+            values = [float(x) for x in re.split(r"[,，]", spec) if x.strip()]
+        else:
+            char, _, slot = spec.partition("/")
+            cand = [d for d in scan_characters()
+                    if d.get("char") == char and (not slot or d.get("slot") == slot)]
+            if not cand:
+                print("没找到存档：%s" % spec)
+                return 1
+            d = cand[0]
+            values = list(d["attrs"])
+            extra += [d["level"], d["ap"], d["sp"]]
+            print("用 %s/%s（%s 等级%g）的属性做特征：%s"
+                  % (d["char"], d["slot"], d["name"], d["level"],
+                     "/".join("%g" % v for v in values)))
+        if len(values) != 5:
+            print("需要 5 个属性值")
+            return 1
+        loc = AttrLocator(log=log)
+        try:
+            print("扫描进程内存中…（内存大，可能要十几秒）")
+            t0 = time.time()
+            hits = loc.scan(values, extra)
+            print("用了 %.1f 秒，找到 %d 个候选：" % (time.time() - t0, len(hits)))
+            for h in hits[:12]:
+                mark = "可写" if h["writable"] else "只读"
+                print("  地址 %#012x 步长 %-2d  额外命中 %d  %s"
+                      % (h["addr"], h["stride"], h["score"], mark))
+            if hits:
+                best = hits[0]
+                print("\n最可能的地址附近的值：")
+                print("  " + "  ".join(loc.dump(best["addr"] - 0x40)))
+        finally:
+            loc.close()
+        return 0
 
     # ---------- 洗点 / 改存档（命令行） ----------
     if args.respec_list:
