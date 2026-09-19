@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import queue
@@ -45,6 +46,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zlib
@@ -998,16 +1000,13 @@ def local_selftest(factor=2.0, log=print):
 # --------------------------------------------------------------------------
 # 洗点：直接改存档文件
 # --------------------------------------------------------------------------
-# 注意：这条路走不通！游戏对存档做了完整性校验（文件里的 32 位串不是常见的
-# md5/sha1/sha256/blake2 中的任何一种），自己改出来的存档会被判为"存档损坏"。
-# 下面这些代码保留着用于**读取**存档（拿角色当前数值），改数值请用内存方式
-# （见 AttrLocator），让游戏自己把新数值写回存档。
-
-# 存档格式（自己解出来的）：
-#     zlib( JSON 正文 )  +  32 位随机 ID  +  \0
+# 存档格式（已完全逆清）：
+#     zlib( JSON 正文 + 32 位校验 + \0 )
+# 其中校验 = md5( JSON正文 + "stOne!characters_v1!<角色目录>!<存档槽>!shArd" )
+# 盐是拼在正文**后面**再算 MD5 的 —— 这正是之前怎么试都算不出来的原因。
+# 算法来自 ss_save_editor_morgan/main.py，并在本机 36 份存档上逐份验证通过。
 # 正文里 characterDataMap 就是玩家的角色数据，属性字段是 STR / AGL / PRC /
 # Vitality / WIL，另有 AP（未分配的属性点）和 SP（未分配的技能点）。
-# 那个 32 位 ID 各种哈希算法都验过，跟内容无关（不是校验和），原样保留即可。
 
 SAVE_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Stoneshard")
 CHARS_DIR = os.path.join(SAVE_ROOT, "characters_v1")
@@ -1033,9 +1032,21 @@ def decode_save(path):
     return text[:end], text[end:].strip("\x00"), obj
 
 
-def encode_save(body, tail):
-    # 注意：尾部那串 ID 和结束符也在压缩流里面，整段一起 zlib 才不会写坏存档
-    return zlib.compress((body + tail + "\x00").encode("utf-8"))
+def save_salt(path):
+    """校验用的盐：stOne!characters_v1!<角色目录>!<存档槽>!shArd"""
+    slot = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    char = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(path))))
+    return "stOne!characters_v1!%s!%s!shArd" % (char, slot)
+
+
+def save_checksum(body, path):
+    return hashlib.md5((body + save_salt(path)).encode("utf-8")).hexdigest()
+
+
+def encode_save(body, path):
+    """重新打包存档：正文 + 校验 + \\0，整体 zlib 压进去。"""
+    checksum = save_checksum(body, path)
+    return zlib.compress((body + checksum + "\x00").encode("utf-8"))
 
 
 def player_span(body):
@@ -1291,6 +1302,116 @@ class AttrLocator:
                 out.append("%+.2f" % v)
         return out
 
+    # ---------- 两步筛选（最稳的定位方式） ----------
+
+    def scan_value(self, value, writable_only=True, cap=400000):
+        """找出内存里等于 value（double）的所有 8 字节对齐地址。"""
+        pat = struct.pack("<d", float(value))
+        out = []
+        for base, size, writable in iter_regions(self.h):
+            if writable_only and not writable:
+                continue
+            off = 0
+            while off < size and len(out) < cap:
+                n = min(4 << 20, size - off)
+                try:
+                    buf = self.mem.read(base + off, n)
+                except OSError:
+                    off += n
+                    continue
+                pos = 0
+                while len(out) < cap:
+                    i = buf.find(pat, pos)
+                    if i < 0:
+                        break
+                    pos = i + 1
+                    addr = base + off + i
+                    if addr % 8 == 0:
+                        out.append(addr)
+                off += n
+        return out
+
+    def filter_value(self, addrs, value):
+        """在候选地址里，留下现在等于 value 的。"""
+        pat = struct.pack("<d", float(value))
+        keep = []
+        for a in addrs:
+            try:
+                if self.mem.read(a, 8) == pat:
+                    keep.append(a)
+            except OSError:
+                pass
+        return keep
+
+    def dump_known(self, addr, span=0x800, known=None):
+        """打印 addr 附近出现的、属于角色已知数值的项（含偏移）。"""
+        known = known or {}
+        out = []
+        try:
+            buf = self.mem.read(addr - span, span * 2)
+        except OSError:
+            return out
+        for o in range(0, len(buf) - 8, 8):
+            v = struct.unpack_from("<d", buf, o)[0]
+            name = known.get(v)
+            if name:
+                out.append((addr - span + o, v, name))
+        return out
+
+
+MEM_CAND_FILE = os.path.join(tempfile.gettempdir(), "stoneshard_mem_cands.txt")
+
+
+def save_candidates(addrs):
+    with open(MEM_CAND_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join("%x" % a for a in addrs))
+    return len(addrs)
+
+
+def load_candidates():
+    if not os.path.exists(MEM_CAND_FILE):
+        return []
+    with open(MEM_CAND_FILE, "r", encoding="utf-8") as f:
+        return [int(x, 16) for x in f.read().split() if x.strip()]
+
+
+def known_character_values():
+    """上次玩的那个角色，把它的已知数值做成 {值: 名字}，用于给候选打分。"""
+    sigs = {}
+    for d in scan_characters():
+        if "error" in d:
+            continue
+        if d["char"] not in sigs or d["mtime"] > sigs[d["char"]]["mtime"]:
+            sigs[d["char"]] = d
+    if not sigs:
+        return {}
+    # 优先用 characters.map 里记录的上次角色
+    try:
+        _b, _t, last = decode_save(os.path.join(CHARS_DIR, "characters.map"))
+        order = [last.get("lastCharacter")] + sorted(sigs)
+    except Exception:
+        order = sorted(sigs)
+    known = {}
+    for ch in order:
+        if ch not in sigs:
+            continue
+        d = sigs[ch]
+        _b, _t, obj = decode_save(d["path"])
+        c = obj["characterDataMap"]
+        fields = [(k, c.get(k)) for k, _cn in ATTRS]
+        fields += [(k, c.get(k)) for k in ("LVL", "XP", "HP", "MP", "AP", "SP",
+                                           "statsTimeLevel", "Immunity",
+                                           "Received_XP", "localX", "localY")]
+        for k, v in fields:
+            if not isinstance(v, (int, float)):
+                continue
+            v = float(v)
+            # 太小的数到处都是（0/1/10/11…），只留有点辨识度的当旁证
+            if abs(v) < 15:
+                continue
+            known.setdefault(v, "%s:%s" % (d["name"], k))
+    return known
+
 
 def scan_characters():
     """扫描所有角色的存档，返回 [{角色, 存档槽, 姓名, 种族, 职业, 等级, 属性, AP, SP, 路径, 时间}]"""
@@ -1338,10 +1459,10 @@ def scan_characters():
 class SaveEditor:
     """洗点 / 改点数：改动前自动备份整份存档目录。"""
 
-    SAVE_WRITE_DISABLED = (
-        "改存档这条路已经停用：实测游戏会对存档做完整性校验，改过的存档会被判为"
-        "「存档损坏」。请改用内存方式（界面上的洗点窗口选完后用内存洗点，或命令行 "
-        "--mem-scan / --mem-write），让游戏自己把新数值写回存档。")
+    def verify(self, path):
+        """检查一份存档的校验值是否正确（重算一遍对比）。"""
+        body, stored, _obj = decode_save(path)
+        return stored == save_checksum(body, path)
 
     def __init__(self, log=None):
         self.log = log or (lambda m: None)
@@ -1402,14 +1523,12 @@ class SaveEditor:
         if do_write:
             tmp = path + ".new"
             with open(tmp, "wb") as f:
-                f.write(encode_save(body, tail))
+                f.write(encode_save(body, path))
             os.replace(tmp, path)
         return diff
 
     def respec_attrs(self, path, floor=ATTR_FLOOR, do_write=True):
         """属性洗点：五项属性回到 floor，省下的点数全部退回 AP。"""
-        if do_write:
-            raise RuntimeError(self.SAVE_WRITE_DISABLED)
         body, tail, obj = decode_save(path)
         c = obj["characterDataMap"]
         old = {k: float(c.get(k, 0.0)) for k, _cn in ATTRS}
@@ -1432,8 +1551,6 @@ class SaveEditor:
 
     def set_sp(self, path, value, do_write=True):
         """直接设定未分配的技能点（技能树已经学过的技能不会退掉）。"""
-        if do_write:
-            raise RuntimeError(self.SAVE_WRITE_DISABLED)
         body, tail, obj = decode_save(path)
         old = float(obj["characterDataMap"].get("SP", 0.0))
         span = player_span(body)
@@ -1451,8 +1568,6 @@ class SaveEditor:
         返还 N 点；职业初始自带的技能也会一起清掉并计入返还，这样你重新加回来
         不会亏（想换个流派也正好）。
         """
-        if do_write:
-            raise RuntimeError(self.SAVE_WRITE_DISABLED)
         body, tail, obj = decode_save(path)
         sdm = obj["skillsDataMap"]
         lst = sdm["skillsAllDataList"]
@@ -1515,8 +1630,8 @@ def respec_window(parent, log):
     rows = {}
     state = {"only_one": tk.BooleanVar(value=False)}
 
-    tk.Label(win, text="⚠ 改存档已停用：游戏会校验存档，改过的文件会被判为「存档损坏」。"
-                       "下面的列表只用来查看角色当前数值/备份；改数值请用内存方式。",
+    tk.Label(win, text="改存档前请先完全退出游戏，否则游戏会把改动覆盖掉。"
+                       "保存时会自动重算存档校验值，改完能正常读取。",
              fg="#a02000", font=("Microsoft YaHei UI", 9, "bold")).pack(
         anchor="w", padx=10, pady=(10, 4))
     tk.Label(win, text="属性洗点 = 五项属性回到下限、省下的点数全部退回 AP（属性点），"
@@ -2016,11 +2131,105 @@ def main(argv=None):
                     help="要写入的五项属性值")
     ap.add_argument("--mem-dump", metavar="地址",
                     help="打印该地址附近的数值，人工确认用")
+    ap.add_argument("--mem-find", metavar="数值",
+                    help="第一步：扫出内存里等于该数值的所有地址（结果存到临时文件）")
+    ap.add_argument("--mem-narrow", metavar="数值",
+                    help="第二步：把上次扫描的候选缩小到「现在等于该数值」的那些")
+    ap.add_argument("--mem-poke", metavar="地址=数值",
+                    help="把某个地址改成指定数值（验证定位是否找对）")
+    ap.add_argument("--mem-near", metavar="地址",
+                    help="列出该地址附近出现的角色已知数值（用来找属性字段）")
+    ap.add_argument("--mem-score", action="store_true",
+                    help="给上次扫描的候选打分：附近出现的角色已知数值越多越像真身")
     args = ap.parse_args(argv)
 
     log = lambda m: print(m, flush=True)
 
     # ---------- 内存方式（不碰存档） ----------
+    if args.mem_find is not None:
+        val = float(args.mem_find)
+        loc = AttrLocator(log=log)
+        try:
+            print("扫描所有等于 %g 的地址…" % val)
+            t0 = time.time()
+            addrs = loc.scan_value(val)
+            n = save_candidates(addrs)
+            print("用了 %.1f 秒，候选 %d 个（已存到 %s）"
+                  % (time.time() - t0, n, MEM_CAND_FILE))
+        finally:
+            loc.close()
+        return 0
+
+    if args.mem_narrow is not None:
+        val = float(args.mem_narrow)
+        addrs = load_candidates()
+        if not addrs:
+            print("没有上次扫描的候选，请先跑 --mem-find")
+            return 1
+        loc = AttrLocator(log=log)
+        try:
+            print("在 %d 个候选里筛出现在等于 %g 的…" % (len(addrs), val))
+            keep = loc.filter_value(addrs, val)
+            save_candidates(keep)
+            print("剩下 %d 个：" % len(keep))
+            for a in keep[:20]:
+                print("   %#012x" % a)
+        finally:
+            loc.close()
+        return 0
+
+    if args.mem_poke:
+        addr_s, _, val_s = args.mem_poke.partition("=")
+        addr, val = int(addr_s, 0), float(val_s)
+        loc = AttrLocator(log=log)
+        try:
+            old = struct.unpack("<d", loc.mem.read(addr, 8))[0]
+            loc.mem.write(addr, struct.pack("<d", val))
+            print("%#x: %g -> %g" % (addr, old, val))
+            print("切回游戏看看界面上那个数值变了没有。")
+        finally:
+            loc.close()
+        return 0
+
+    if args.mem_near:
+        addr = int(args.mem_near, 0)
+        loc = AttrLocator(log=log)
+        try:
+            known = known_character_values()
+            print("地址 %#x 附近 ±0x800 内出现的角色已知数值：" % addr)
+            for a, v, name in loc.dump_known(addr, known=known):
+                print("   %#012x  %-20s %g   (偏移 %+#x)" % (a, name, v, a - addr))
+        finally:
+            loc.close()
+        return 0
+
+    if args.mem_score:
+        addrs = load_candidates()
+        if not addrs:
+            print("没有候选，请先跑 --mem-find")
+            return 1
+        known = known_character_values()
+        loc = AttrLocator(log=log)
+        try:
+            print("给 %d 个候选打分（附近 ±0x800 里出现多少个角色已知数值）…" % len(addrs))
+            scored = []
+            for a in addrs:
+                hits = loc.dump_known(a, known=known)
+                score = len(set(h[2] for h in hits))
+                if score:
+                    scored.append((score, a, hits))
+            scored.sort(key=lambda x: -x[0])
+            print("有命中的候选 %d 个，前 15：" % len(scored))
+            for score, a, hits in scored[:15]:
+                uniq = {}
+                for h in hits:
+                    uniq.setdefault(h[2].split(":")[-1], h[1])
+                names = ", ".join("%s=%g" % (k, v) for k, v in list(uniq.items())[:10])
+                print("   %#012x  命中 %2d 个: %s" % (a, score, names))
+        finally:
+            loc.close()
+        return 0
+
     if args.mem_dump:
         loc = AttrLocator(log=log)
         try:
