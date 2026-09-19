@@ -34,8 +34,15 @@ F8 被别的软件占用时会自动改用 F9、F10、F11，界面上会显示�
 举例：一个 25 级角色是 21/11/25/11/10、属性点剩 0（总共 78 点），洗点后变成
 10/10/10/10/10、属性点 28 —— 你可以按自己的新思路重新加 28 点。
 
-**技能点**：直接把未分配的技能点设成你要的数字。注意这**不会退掉已经学会的技能**
-（技能树的依赖关系在游戏数据里，光靠存档算不准，所以没做自动退技能）。
+**技能洗点**：把已经学会的技能**全部清空**（技能栏也一起清），并按清掉的技能数量
+返还技能点。加点规则是实测出来的——**每升一级 1 点、每个技能 1 点**：同一个职业
+不同等级的存档反推出来的"初始自带技能数"完全恒定（战士/猎人 6 个、游侠 5 个），
+说明这个模型没错。
+
+职业初始自带的技能也会被一起清掉，所以返还的点数会比你自己花掉的多几个（那几个
+正好用来把初始技能学回来），**不会亏**；想借机换个流派也正好。
+
+另外还有「技能点直接设为 N」，想精确控制数量就用它。
 
 用法：**先完全退出游戏**，点「洗点」，选一行存档，点「洗点」按钮；默认会把该角色的
 所有存档一起改（因为游戏"继续游戏"读的可能是另一份），也可以勾「只改选中的这一份」。
@@ -50,7 +57,8 @@ F8 被别的软件占用时会自动改用 F9、F10、F11，界面上会显示�
 python stoneshard_accel.py --respec-list            # 列出所有存档和属性
 python stoneshard_accel.py --respec character_3     # 给 character_3 全部存档洗点
 python stoneshard_accel.py --respec character_3/save_1   # 只洗指定的一份
-python stoneshard_accel.py --respec-sp character_3=5     # 技能点设为 5
+python stoneshard_accel.py --respec-skills character_3   # 技能洗点（清技能、退点数）
+python stoneshard_accel.py --respec-sp character_3=5     # 技能点直接设为 5
 python stoneshard_accel.py --respec-backup          # 手动备份
 python stoneshard_accel.py --respec-restore 20260919_213000   # 从备份还原
 ```

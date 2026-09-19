@@ -1062,6 +1062,64 @@ def _fmt_num(v):
     return "%.1f" % float(v) if float(v) == int(v) else repr(float(v))
 
 
+def _list_span(body, key, start=0):
+    """定位 "key": [ ... ] 这个数组在正文里的 [起, 止) 区间。"""
+    i = body.find('"%s"' % key, start)
+    if i < 0:
+        return None
+    j = body.find("[", body.find(":", i))
+    if j < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for p in range(j, len(body)):
+        ch = body[p]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return (j, p + 1)
+    return None
+
+
+def _split_items(seg):
+    """把 "[ a, b, c ]" 拆成元素文本列表（这些元素都是简单值，不含嵌套）。"""
+    inner = seg.strip()[1:-1]
+    if "[" in inner or "]" in inner:
+        raise RuntimeError("列表结构比预期复杂，放弃")
+    items, cur, in_str, esc = [], [], False, False
+    for ch in inner:
+        if in_str:
+            cur.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            cur.append(ch)
+        elif ch == ",":
+            items.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    rest = "".join(cur).strip()
+    if rest:
+        items.append(rest)
+    return items
+
+
 def _set_numbers(body, span, pairs):
     """在指定区间里，把若干 "键": 数字 替换成新值；每个键只替换第一次出现。"""
     seg = body[span[0]:span[1]]
@@ -1171,7 +1229,9 @@ class SaveEditor:
 
     def _apply(self, path, body, tail, before, after, expect_keys, do_write):
         diff = text_diff(before, after)
-        bad = [d for d in diff if d[0].rsplit("/", 1)[-1] not in expect_keys]
+        def leaf(d):
+            return re.sub(r"(\[\d+\])+$", "", d[0].rsplit("/", 1)[-1])
+        bad = [d for d in diff if leaf(d) not in expect_keys]
         if bad:
             raise RuntimeError("改动范围异常，已放弃：%s" % bad[:3])
         if not diff:
@@ -1216,6 +1276,56 @@ class SaveEditor:
         new_obj = json.loads(new_body)
         diff = self._apply(path, new_body, tail, obj, new_obj, {"SP"}, do_write)
         return {"old": old, "new": float(value), "diff": diff}
+
+    def respec_skills(self, path, do_write=True):
+        """技能洗点：清空已学技能（连技能栏一起清），并按清掉的技能数返还技能点。
+
+        游戏里加点规则实测是「每级 1 点、每个技能 1 点」，所以清掉 N 个技能就
+        返还 N 点；职业初始自带的技能也会一起清掉并计入返还，这样你重新加回来
+        不会亏（想换个流派也正好）。
+        """
+        body, tail, obj = decode_save(path)
+        sdm = obj["skillsDataMap"]
+        lst = sdm["skillsAllDataList"]
+        groups = len(lst) // 5
+        learned = [i for i in range(groups) if lst[i * 5 + 1] == 1.0]
+        if not learned:
+            raise RuntimeError("这个存档已经没有可洗的技能了")
+
+        # 1) 已学标记清零
+        span = _list_span(body, "skillsAllDataList")
+        if not span:
+            raise RuntimeError("找不到技能列表")
+        items = _split_items(body[span[0]:span[1]])
+        if len(items) != len(lst):
+            raise RuntimeError("技能列表长度不符（%d vs %d）" % (len(items), len(lst)))
+        for i in learned:
+            items[i * 5 + 1] = "0.0"
+        body = (body[:span[0]] + "[ " + ", ".join(items) + " ]" + body[span[1]:])
+
+        # 2) 技能栏清空（空位用 -4.0 表示）
+        span = _list_span(body, "skillsPanelDataList")
+        if not span:
+            raise RuntimeError("找不到技能栏数据")
+        seg = body[span[0]:span[1]]
+        # skillsPanelDataList 是「数组的数组」，逐页处理
+        new_pages = []
+        for page in re.findall(r"\[[^\[\]]*\]", seg):
+            cells = _split_items(page)
+            new_pages.append("[ " + ", ".join(
+                ("-4.0" if c.strip().startswith('"') else c) for c in cells) + " ]")
+        body = body[:span[0]] + "[ " + ", ".join(new_pages) + " ]" + body[span[1]:]
+
+        # 3) 返还技能点
+        sp_old = float(obj["characterDataMap"].get("SP", 0.0))
+        sp_new = sp_old + len(learned)
+        body = _set_numbers(body, player_span(body), [("SP", sp_new)])
+
+        new_obj = json.loads(body)
+        diff = self._apply(path, body, tail, obj, new_obj,
+                           {"SP", "skillsAllDataList", "skillsPanelDataList"}, do_write)
+        return {"cleared": len(learned), "sp_old": sp_old, "sp_new": sp_new, "diff": diff,
+                "names": [lst[i * 5] for i in learned]}
 
 
 # --------------------------------------------------------------------------
@@ -1340,6 +1450,35 @@ def respec_window(parent, log):
             log("改技能点失败：%s" % exc)
             messagebox.showerror("失败", str(exc))
 
+    def do_respec_skills():
+        d = selected()
+        if not d:
+            return
+        if find_pid() and not messagebox.askyesno(
+                "游戏还在运行", "检测到游戏正在运行，改动可能被覆盖。仍然继续吗？"):
+            return
+        tgt = targets(d)
+        if not messagebox.askyesno(
+                "确认技能洗点",
+                "将清空 %s 的 %d 份存档里「学会的技能」（技能栏也一起清空），\n"
+                "并按清掉的技能数量返还技能点。\n\n"
+                "注意：职业初始自带的技能也会一起清掉，所以返还的点数会比你自己\n"
+                "花掉的多几个（那几个正好用来把初始技能学回来），不会亏。\n\n继续吗？"
+                % (d["char"], len(tgt))):
+            return
+        try:
+            ed.backup()
+            for t in tgt:
+                r = ed.respec_skills(t["path"])
+                log("  %s/%s：清空 %d 个技能，技能点 %g -> %g"
+                    % (t["char"], t["slot"], r["cleared"], r["sp_old"], r["sp_new"]))
+            refresh()
+            messagebox.showinfo("完成", "技能已清空、点数已返还。\n"
+                                        "进游戏后在技能面板里重新学。")
+        except Exception as exc:
+            log("技能洗点失败：%s" % exc)
+            messagebox.showerror("失败", str(exc))
+
     def do_backup():
         try:
             ed.backup()
@@ -1388,12 +1527,18 @@ def respec_window(parent, log):
 
     act = ttk.LabelFrame(win, text="操作", padding=8)
     act.pack(fill="x", padx=10, pady=8)
-    ttk.Label(act, text="属性洗点（重置下限 %d）：" % ATTR_FLOOR).pack(side="left")
-    ttk.Button(act, text="洗点", command=do_respec, width=10).pack(side="left", padx=6)
-    ttk.Label(act, text="　技能点设为：").pack(side="left")
+    r1 = ttk.Frame(act)
+    r1.pack(fill="x")
+    ttk.Label(r1, text="属性洗点（五项属性回到 %d，点数退回属性点）：" % ATTR_FLOOR).pack(side="left")
+    ttk.Button(r1, text="洗属性", command=do_respec, width=10).pack(side="left", padx=6)
+    r2 = ttk.Frame(act)
+    r2.pack(fill="x", pady=(6, 0))
+    ttk.Label(r2, text="技能洗点（清空已学技能，按数量返还技能点）：").pack(side="left")
+    ttk.Button(r2, text="洗技能", command=do_respec_skills, width=10).pack(side="left", padx=6)
+    ttk.Label(r2, text="　技能点直接设为：").pack(side="left")
     sp_var = tk.StringVar(value="1")
-    ttk.Entry(act, textvariable=sp_var, width=6).pack(side="left")
-    ttk.Button(act, text="应用", command=do_sp, width=8).pack(side="left", padx=6)
+    ttk.Entry(r2, textvariable=sp_var, width=6).pack(side="left")
+    ttk.Button(r2, text="应用", command=do_sp, width=8).pack(side="left", padx=6)
 
     logbox = tk.Text(win, height=8, state="disabled", wrap="word",
                      bg="#111111", fg="#d0d0d0", font=("Consolas", 9))
@@ -1683,6 +1828,8 @@ def main(argv=None):
                     help="列出所有角色存档（等级、属性、属性点、技能点）")
     ap.add_argument("--respec", metavar="角色[/存档槽]",
                     help="属性洗点：属性回到下限，点数退回属性点（会自动先备份）")
+    ap.add_argument("--respec-skills", metavar="角色[/存档槽]",
+                    help="技能洗点：清空已学技能，按清掉的技能数返还技能点")
     ap.add_argument("--respec-sp", metavar="角色[/存档槽]=数值",
                     help="把未分配的技能点设为指定值")
     ap.add_argument("--respec-backup", action="store_true", help="备份全部存档")
@@ -1723,8 +1870,8 @@ def main(argv=None):
         ed.restore(args.respec_restore)
         return 0
 
-    if args.respec or args.respec_sp:
-        spec = args.respec or args.respec_sp
+    if args.respec or args.respec_sp or args.respec_skills:
+        spec = args.respec or args.respec_sp or args.respec_skills
         value = None
         if args.respec_sp:
             if "=" not in spec:
@@ -1744,6 +1891,10 @@ def main(argv=None):
             if args.respec_sp:
                 r = ed.set_sp(d["path"], value)
                 print("%s/%s：技能点 %g -> %g" % (d["char"], d["slot"], r["old"], r["new"]))
+            elif args.respec_skills:
+                r = ed.respec_skills(d["path"])
+                print("%s/%s：清空 %d 个已学技能，技能点 %g -> %g"
+                      % (d["char"], d["slot"], r["cleared"], r["sp_old"], r["sp_new"]))
             else:
                 r = ed.respec_attrs(d["path"])
                 print("%s/%s：属性 %s -> %s，属性点 %g -> %g" % (
