@@ -37,13 +37,17 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import queue
+import re
+import shutil
 import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from ctypes import wintypes as wt
 
 # --------------------------------------------------------------------------
@@ -965,10 +969,449 @@ def local_selftest(factor=2.0, log=print):
 
 
 # --------------------------------------------------------------------------
+# 洗点：直接改存档文件
+# --------------------------------------------------------------------------
+# 存档格式（自己解出来的）：
+#     zlib( JSON 正文 )  +  32 位随机 ID  +  \0
+# 正文里 characterDataMap 就是玩家的角色数据，属性字段是 STR / AGL / PRC /
+# Vitality / WIL，另有 AP（未分配的属性点）和 SP（未分配的技能点）。
+# 那个 32 位 ID 各种哈希算法都验过，跟内容无关（不是校验和），原样保留即可。
+
+SAVE_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Stoneshard")
+CHARS_DIR = os.path.join(SAVE_ROOT, "characters_v1")
+BACKUP_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Stoneshard_Backup")
+
+# 属性字段名 -> 中文名
+ATTRS = [
+    ("STR", "力量"),
+    ("AGL", "敏捷"),
+    ("PRC", "感知"),
+    ("Vitality", "体质"),
+    ("WIL", "意志"),
+]
+ATTR_FLOOR = 10          # 属性重置后的最低值（游戏里任何角色都没低过这个数）
+SLOT_ORDER = ["save_1", "save_2", "exitsave_1", "autosave_1", "autosave_2", "autosave_3"]
+
+
+def decode_save(path):
+    """读存档：返回 (JSON 正文字符串, 尾部 32 位 ID, 解析后的对象)"""
+    with open(path, "rb") as f:
+        text = zlib.decompress(f.read()).decode("utf-8")
+    obj, end = json.JSONDecoder().raw_decode(text)
+    return text[:end], text[end:].strip("\x00"), obj
+
+
+def encode_save(body, tail):
+    # 注意：尾部那串 ID 和结束符也在压缩流里面，整段一起 zlib 才不会写坏存档
+    return zlib.compress((body + tail + "\x00").encode("utf-8"))
+
+
+def player_span(body):
+    """定位玩家自己的 characterDataMap 在正文里的 [起, 止) 字符区间。"""
+    i = body.find('"characterDataMap"')
+    if i < 0:
+        return None
+    j = body.find("{", body.find(":", i))
+    if j < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for p in range(j, len(body)):
+        ch = body[p]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return (j, p + 1)
+    return None
+
+
+def text_diff(a, b, path=""):
+    """比较两个 JSON 对象，列出所有差异路径。"""
+    out = []
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in sorted(set(a) | set(b)):
+            if k not in a:
+                out.append((path + "/" + k, None, b[k]))
+            elif k not in b:
+                out.append((path + "/" + k, a[k], None))
+            else:
+                out += text_diff(a[k], b[k], path + "/" + k)
+    elif isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            out.append((path, "长度 %d" % len(a), "长度 %d" % len(b)))
+        else:
+            for i, (x, y) in enumerate(zip(a, b)):
+                out += text_diff(x, y, "%s[%d]" % (path, i))
+    elif a != b:
+        out.append((path, a, b))
+    return out
+
+
+def _fmt_num(v):
+    """按游戏的写法输出数字：整数写成 21.0 这种。"""
+    return "%.1f" % float(v) if float(v) == int(v) else repr(float(v))
+
+
+def _set_numbers(body, span, pairs):
+    """在指定区间里，把若干 "键": 数字 替换成新值；每个键只替换第一次出现。"""
+    seg = body[span[0]:span[1]]
+    for key, value in pairs:
+        pat = re.compile(r'("%s"\s*:\s*)(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)'
+                         % re.escape(key))
+        def rep(m):
+            return m.group(1) + _fmt_num(value)
+        seg, n = pat.subn(rep, seg, count=1)
+        if n != 1:
+            raise RuntimeError("没找到字段 %s（游戏版本可能变了）" % key)
+    return body[:span[0]] + seg + body[span[1]:]
+
+
+def scan_characters():
+    """扫描所有角色的存档，返回 [{角色, 存档槽, 姓名, 种族, 职业, 等级, 属性, AP, SP, 路径, 时间}]"""
+    out = []
+    if not os.path.isdir(CHARS_DIR):
+        return out
+    for char in sorted(os.listdir(CHARS_DIR)):
+        cdir = os.path.join(CHARS_DIR, char)
+        if not os.path.isdir(cdir):
+            continue
+        meta = {}
+        mpath = os.path.join(cdir, "character.map")
+        if os.path.exists(mpath):
+            try:
+                _b, _t, m = decode_save(mpath)
+                meta = m
+            except Exception:
+                pass
+        for slot in SLOT_ORDER:
+            path = os.path.join(cdir, slot, "data.sav")
+            if not os.path.exists(path):
+                continue
+            try:
+                _body, _tail, obj = decode_save(path)
+                c = obj.get("characterDataMap", {})
+                attrs = [float(c.get(k, 0.0)) for k, _cn in ATTRS]
+            except Exception as exc:
+                out.append({"char": char, "slot": slot, "error": str(exc), "path": path})
+                continue
+            out.append({
+                "char": char, "slot": slot,
+                "name": meta.get("nameKey") or c.get("nameKey"),
+                "race": c.get("raceKey"), "class": c.get("playerClass"),
+                "level": float(c.get("LVL", 0)),
+                "attrs": attrs,
+                "ap": float(c.get("AP", 0.0)),
+                "sp": float(c.get("SP", 0.0)),
+                "path": path,
+                "mtime": os.path.getmtime(path),
+                "permadeath": float(meta.get("permadeath", 0.0)),
+            })
+    return out
+
+
+class SaveEditor:
+    """洗点 / 改点数：改动前自动备份整份存档目录。"""
+
+    def __init__(self, log=None):
+        self.log = log or (lambda m: None)
+        self.last_backup = None
+
+    # ---------- 备份 ----------
+
+    def backup(self):
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        dst = os.path.join(BACKUP_ROOT, stamp)
+        os.makedirs(dst, exist_ok=True)
+        for name in ("characters_v1", "characters.map"):
+            src = os.path.join(SAVE_ROOT, name)
+            if os.path.isdir(src):
+                shutil.copytree(src, os.path.join(dst, name))
+            elif os.path.isfile(src):
+                shutil.copy2(src, dst)
+        for name in os.listdir(SAVE_ROOT):
+            p = os.path.join(SAVE_ROOT, name)
+            if os.path.isdir(p) and name not in ("characters_v1",):
+                shutil.copytree(p, os.path.join(dst, name))
+        self.last_backup = dst
+        self.log("已备份存档到 %s" % dst)
+        return dst
+
+    def list_backups(self):
+        if not os.path.isdir(BACKUP_ROOT):
+            return []
+        return sorted((d for d in os.listdir(BACKUP_ROOT)
+                       if os.path.isdir(os.path.join(BACKUP_ROOT, d))), reverse=True)
+
+    def restore(self, stamp):
+        src = os.path.join(BACKUP_ROOT, stamp)
+        if not os.path.isdir(src):
+            raise RuntimeError("找不到备份 %s" % stamp)
+        for name in os.listdir(src):
+            s = os.path.join(src, name)
+            d = os.path.join(SAVE_ROOT, name)
+            if os.path.isdir(s):
+                if os.path.isdir(d):
+                    shutil.rmtree(d)
+                shutil.copytree(s, d)
+            else:
+                shutil.copy2(s, d)
+        self.log("已从备份 %s 恢复存档" % stamp)
+
+    # ---------- 改档 ----------
+
+    def _apply(self, path, body, tail, before, after, expect_keys, do_write):
+        diff = text_diff(before, after)
+        bad = [d for d in diff if d[0].rsplit("/", 1)[-1] not in expect_keys]
+        if bad:
+            raise RuntimeError("改动范围异常，已放弃：%s" % bad[:3])
+        if not diff:
+            raise RuntimeError("没有产生任何改动")
+        if do_write:
+            tmp = path + ".new"
+            with open(tmp, "wb") as f:
+                f.write(encode_save(body, tail))
+            os.replace(tmp, path)
+        return diff
+
+    def respec_attrs(self, path, floor=ATTR_FLOOR, do_write=True):
+        """属性洗点：五项属性回到 floor，省下的点数全部退回 AP。"""
+        body, tail, obj = decode_save(path)
+        c = obj["characterDataMap"]
+        old = {k: float(c.get(k, 0.0)) for k, _cn in ATTRS}
+        old_ap = float(c.get("AP", 0.0))
+        total = sum(old.values()) + old_ap
+        new_ap = total - floor * len(ATTRS)
+        if new_ap < 0:
+            raise RuntimeError("点数不够回退（总点数 %.0f < 下限 %d）"
+                               % (total, floor * len(ATTRS)))
+        span = player_span(body)
+        if not span:
+            raise RuntimeError("存档里找不到角色数据段")
+        pairs = [(k, floor) for k, _cn in ATTRS] + [("AP", new_ap)]
+        new_body = _set_numbers(body, span, pairs)
+        new_obj = json.loads(new_body)
+        diff = self._apply(path, new_body, tail, obj, new_obj,
+                           set(k for k, _cn in ATTRS) | {"AP"}, do_write)
+        return {"old": old, "old_ap": old_ap, "new_ap": new_ap, "diff": diff,
+                "total": total}
+
+    def set_sp(self, path, value, do_write=True):
+        """直接设定未分配的技能点（技能树已经学过的技能不会退掉）。"""
+        body, tail, obj = decode_save(path)
+        old = float(obj["characterDataMap"].get("SP", 0.0))
+        span = player_span(body)
+        if not span:
+            raise RuntimeError("存档里找不到角色数据段")
+        new_body = _set_numbers(body, span, [("SP", value)])
+        new_obj = json.loads(new_body)
+        diff = self._apply(path, new_body, tail, obj, new_obj, {"SP"}, do_write)
+        return {"old": old, "new": float(value), "diff": diff}
+
+
+# --------------------------------------------------------------------------
 # 图形界面
 # --------------------------------------------------------------------------
 
-def run_gui():
+def respec_window(parent, log):
+    """洗点窗口：列出所有角色存档，支持属性洗点和补技能点。"""
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    win = tk.Toplevel(parent)
+    win.title("洗点 / 改存档")
+    win.geometry("880x580+120+60")
+    win.transient(parent)
+
+    ed = SaveEditor(log)
+    rows = {}
+    state = {"only_one": tk.BooleanVar(value=False)}
+
+    tk.Label(win, text="改存档前请先完全退出游戏，否则游戏会把改动覆盖掉。",
+             fg="#a02000", font=("Microsoft YaHei UI", 9, "bold")).pack(
+        anchor="w", padx=10, pady=(10, 4))
+    tk.Label(win, text="属性洗点 = 五项属性回到下限、省下的点数全部退回 AP（属性点），"
+                       "总点数不变；进游戏后在角色界面重新分配。",
+             fg="#555555", justify="left", wraplength=820).pack(anchor="w", padx=10)
+
+    cols = ("char", "slot", "name", "race", "lvl", "attrs", "ap", "sp", "time")
+    heads = ("角色", "存档", "姓名", "种族", "等级", "力/敏/感/体/意", "属性点", "技能点", "存档时间")
+    widths = (78, 92, 70, 62, 48, 130, 62, 62, 132)
+    wrap = ttk.Frame(win)
+    wrap.pack(fill="both", expand=True, padx=10, pady=6)
+    tree = ttk.Treeview(wrap, columns=cols, show="headings", height=12)
+    for c, h, w in zip(cols, heads, widths):
+        tree.heading(c, text=h)
+        tree.column(c, width=w, anchor="center")
+    tree.pack(side="left", fill="both", expand=True)
+    sb = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+    sb.pack(side="right", fill="y")
+    tree.configure(yscrollcommand=sb.set)
+
+    def refresh():
+        tree.delete(*tree.get_children())
+        rows.clear()
+        data = scan_characters()
+        if not data:
+            log("没找到存档（%s 不存在？）" % CHARS_DIR)
+        for d in data:
+            if "error" in d:
+                tree.insert("", "end", values=(d["char"], d["slot"], "读取失败", "", "", "",
+                                               "", "", ""), tags=("err",))
+                continue
+            t = time.strftime("%m-%d %H:%M", time.localtime(d["mtime"]))
+            iid = tree.insert("", "end", values=(
+                d["char"], d["slot"], d["name"], d["race"], "%g" % d["level"],
+                "/".join("%g" % a for a in d["attrs"]),
+                "%g" % d["ap"], "%g" % d["sp"], t))
+            rows[iid] = d
+        log("扫描到 %d 份存档" % len(rows))
+
+    def selected():
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("先选一个", "请先在列表里点一行存档。")
+            return None
+        return rows.get(sel[0])
+
+    def targets(d):
+        """默认把该角色的所有存档一起改，避免游戏读的是另一份。"""
+        if state["only_one"].get():
+            return [d]
+        return [x for x in rows.values() if x.get("char") == d["char"]]
+
+    def do_respec():
+        d = selected()
+        if not d:
+            return
+        if find_pid():
+            if not messagebox.askyesno("游戏还在运行",
+                                       "检测到游戏正在运行，改动可能被覆盖。\n仍然继续吗？"):
+                return
+        tgt = targets(d)
+        if not messagebox.askyesno("确认洗点",
+                                   "将对 %s 的 %d 份存档做属性洗点：\n"
+                                   "属性回到 %d，省下的点数退回「属性点」。\n\n继续吗？"
+                                   % (d["char"], len(tgt), ATTR_FLOOR)):
+            return
+        try:
+            ed.backup()
+            for t in tgt:
+                r = ed.respec_attrs(t["path"])
+                log("  %s/%s：属性点 %.0f -> %.0f（总点数 %.0f）"
+                    % (t["char"], t["slot"], r["old_ap"], r["new_ap"], r["total"]))
+            refresh()
+            messagebox.showinfo("完成", "洗点完成。\n进游戏后在角色界面重新分配点数。\n"
+                                        "如果游戏不认存档，用「恢复备份」还原。")
+        except Exception as exc:
+            log("洗点失败：%s" % exc)
+            messagebox.showerror("失败", str(exc))
+
+    def do_sp():
+        d = selected()
+        if not d:
+            return
+        try:
+            value = float(sp_var.get())
+        except ValueError:
+            messagebox.showerror("数值不对", "技能点要填数字。")
+            return
+        if find_pid() and not messagebox.askyesno(
+                "游戏还在运行", "检测到游戏正在运行，改动可能被覆盖。仍然继续吗？"):
+            return
+        tgt = targets(d)
+        try:
+            ed.backup()
+            for t in tgt:
+                r = ed.set_sp(t["path"], value)
+                log("  %s/%s：技能点 %.0f -> %.0f" % (t["char"], t["slot"], r["old"], r["new"]))
+            refresh()
+            messagebox.showinfo("完成", "技能点已改为 %g。" % value)
+        except Exception as exc:
+            log("改技能点失败：%s" % exc)
+            messagebox.showerror("失败", str(exc))
+
+    def do_backup():
+        try:
+            ed.backup()
+            messagebox.showinfo("已备份", "备份目录：\n%s" % ed.last_backup)
+        except Exception as exc:
+            messagebox.showerror("备份失败", str(exc))
+
+    def do_restore():
+        backups = ed.list_backups()
+        if not backups:
+            messagebox.showinfo("没有备份", "还没有备份。")
+            return
+        top = tk.Toplevel(win)
+        top.title("选择要恢复的备份")
+        top.geometry("360x260")
+        lb = tk.Listbox(top)
+        for b in backups:
+            lb.insert("end", b)
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def go():
+            sel = lb.curselection()
+            if not sel:
+                return
+            stamp = backups[sel[0]]
+            if not messagebox.askyesno("确认恢复",
+                                       "用备份 %s 覆盖当前存档？当前存档会被替换。" % stamp):
+                return
+            try:
+                ed.restore(stamp)
+                refresh()
+                top.destroy()
+                messagebox.showinfo("完成", "已恢复备份 %s" % stamp)
+            except Exception as exc:
+                messagebox.showerror("恢复失败", str(exc))
+
+        ttk.Button(top, text="恢复选中的备份", command=go).pack(pady=8)
+
+    bar = ttk.Frame(win)
+    bar.pack(fill="x", padx=10)
+    ttk.Button(bar, text="刷新列表", command=refresh, width=10).pack(side="left")
+    ttk.Button(bar, text="备份全部存档", command=do_backup, width=14).pack(side="left", padx=6)
+    ttk.Button(bar, text="恢复备份…", command=do_restore, width=12).pack(side="left")
+    ttk.Checkbutton(bar, text="只改选中的这一份存档", variable=state["only_one"]).pack(
+        side="left", padx=12)
+
+    act = ttk.LabelFrame(win, text="操作", padding=8)
+    act.pack(fill="x", padx=10, pady=8)
+    ttk.Label(act, text="属性洗点（重置下限 %d）：" % ATTR_FLOOR).pack(side="left")
+    ttk.Button(act, text="洗点", command=do_respec, width=10).pack(side="left", padx=6)
+    ttk.Label(act, text="　技能点设为：").pack(side="left")
+    sp_var = tk.StringVar(value="1")
+    ttk.Entry(act, textvariable=sp_var, width=6).pack(side="left")
+    ttk.Button(act, text="应用", command=do_sp, width=8).pack(side="left", padx=6)
+
+    logbox = tk.Text(win, height=8, state="disabled", wrap="word",
+                     bg="#111111", fg="#d0d0d0", font=("Consolas", 9))
+    logbox.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def log_to_window(msg):
+        log(msg)
+        logbox.configure(state="normal")
+        logbox.insert("end", "%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+        logbox.see("end")
+        logbox.configure(state="disabled")
+
+    ed.log = log_to_window
+    refresh()
+    return win
+
+
+def run_gui(open_respec=False):
     import tkinter as tk
     from tkinter import messagebox, ttk
 
@@ -1165,6 +1608,13 @@ def run_gui():
     ttk.Checkbutton(btns, text="自动连接", variable=state["auto"]).pack(side="left", padx=10)
     ttk.Button(btns, text="退出", command=on_quit, width=8).pack(side="right")
 
+    row2 = ttk.Frame(root, padding=(10, 6))
+    row2.pack(fill="x")
+    ttk.Button(row2, text="洗点 / 改存档", width=16,
+               command=lambda: respec_window(root, log)).pack(side="left")
+    ttk.Label(row2, text="（改存档需要先完全退出游戏）",
+              foreground="#888888").pack(side="left", padx=8)
+
     logbox = tk.Text(root, height=12, state="disabled", wrap="word",
                      bg="#111111", fg="#d0d0d0", font=("Consolas", 9))
     logbox.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1200,6 +1650,8 @@ def run_gui():
     root.protocol("WM_DELETE_WINDOW", on_quit)
     root.after(500, tick)
     root.after(100, poll_hotkey_queue)
+    if open_respec:
+        root.after(300, lambda: respec_window(root, log))
     root.mainloop()
 
 
@@ -1227,9 +1679,80 @@ def main(argv=None):
                     help="要挂钩的计时函数，逗号分隔")
     ap.add_argument("--hook-all-modules", action="store_true",
                     help="连游戏目录下所有 DLL 的导入表一起挂（默认只挂主程序）")
+    ap.add_argument("--respec-list", action="store_true",
+                    help="列出所有角色存档（等级、属性、属性点、技能点）")
+    ap.add_argument("--respec", metavar="角色[/存档槽]",
+                    help="属性洗点：属性回到下限，点数退回属性点（会自动先备份）")
+    ap.add_argument("--respec-sp", metavar="角色[/存档槽]=数值",
+                    help="把未分配的技能点设为指定值")
+    ap.add_argument("--respec-backup", action="store_true", help="备份全部存档")
+    ap.add_argument("--respec-restore", metavar="备份时间戳", help="从备份恢复存档")
+    ap.add_argument("--respec-gui", action="store_true",
+                    help="打开界面并直接弹出洗点窗口")
     args = ap.parse_args(argv)
 
     log = lambda m: print(m, flush=True)
+
+    # ---------- 洗点 / 改存档（命令行） ----------
+    if args.respec_list:
+        data = scan_characters()
+        if not data:
+            print("没找到存档：%s" % CHARS_DIR)
+            return 1
+        print("%-13s %-11s %-8s %-8s %5s %-24s %6s %6s" %
+              ("角色", "存档", "姓名", "种族", "等级", "力/敏/感/体/意", "属性点", "技能点"))
+        for d in data:
+            if "error" in d:
+                print("%-13s %-11s 读取失败: %s" % (d["char"], d["slot"], d["error"]))
+                continue
+            print("%-13s %-11s %-8s %-8s %5g %-24s %6g %6g" % (
+                d["char"], d["slot"], d["name"], d["race"], d["level"],
+                "/".join("%g" % a for a in d["attrs"]), d["ap"], d["sp"]))
+        print("\n备份目录: %s" % BACKUP_ROOT)
+        for b in SaveEditor().list_backups()[:5]:
+            print("  已有备份: %s" % b)
+        return 0
+
+    if args.respec_backup:
+        ed = SaveEditor(log)
+        ed.backup()
+        return 0
+
+    if args.respec_restore:
+        ed = SaveEditor(log)
+        ed.restore(args.respec_restore)
+        return 0
+
+    if args.respec or args.respec_sp:
+        spec = args.respec or args.respec_sp
+        value = None
+        if args.respec_sp:
+            if "=" not in spec:
+                print("格式：--respec-sp 角色=数值")
+                return 1
+            spec, _, v = spec.partition("=")
+            value = float(v)
+        char, _, slot = spec.partition("/")
+        data = [d for d in scan_characters()
+                if d.get("char") == char and (not slot or d.get("slot") == slot)]
+        if not data:
+            print("没找到匹配的存档：%s" % spec)
+            return 1
+        ed = SaveEditor(log)
+        ed.backup()
+        for d in data:
+            if args.respec_sp:
+                r = ed.set_sp(d["path"], value)
+                print("%s/%s：技能点 %g -> %g" % (d["char"], d["slot"], r["old"], r["new"]))
+            else:
+                r = ed.respec_attrs(d["path"])
+                print("%s/%s：属性 %s -> %s，属性点 %g -> %g" % (
+                    d["char"], d["slot"],
+                    "/".join("%g" % x for x in r["old"].values()),
+                    "/".join("%g" % ATTR_FLOOR for _ in ATTRS),
+                    r["old_ap"], r["new_ap"]))
+        print("完成。进游戏后在角色界面重新分配点数；不满意可用 --respec-restore 还原。")
+        return 0
 
     if args.selftest:
         print("本地自检：把计时函数加速 2.0 倍，量 1 秒内它走了多少…")
@@ -1301,7 +1824,7 @@ def main(argv=None):
             acc.close()
         return 0
 
-    run_gui()
+    run_gui(open_respec=args.respec_gui)
     return 0
 
 
