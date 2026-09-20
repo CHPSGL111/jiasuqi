@@ -2154,8 +2154,6 @@ def run_gui(open_respec=False):
     root.minsize(480, 400)
 
     accel = Accelerator()
-    qs = QuickSave(log)
-    watch = {"last": qs.newest_mtime()}
     state = {"auto": tk.BooleanVar(value=True), "want": 1.5, "on": True}
 
     # ---- 日志 ----
@@ -2167,6 +2165,8 @@ def run_gui(open_respec=False):
         logbox.configure(state="disabled")
 
     accel.log = log
+    qs = QuickSave(log)
+    watch = {"last": qs.newest_mtime()}
 
     def do_quicksave():
         log("快速存档：让游戏写盘并快照…（期间别动鼠标）")
