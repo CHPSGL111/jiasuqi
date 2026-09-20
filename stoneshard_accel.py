@@ -195,6 +195,11 @@ MOD_NOREPEAT = 0x4000
 # 依次尝试，第一个能注册上的就用（避免和别的软件撞车）
 HOTKEY_CANDIDATES = [("F8", 0x77), ("F9", 0x78), ("F10", 0x79), ("F11", 0x7A)]
 
+# 快速存档 / 快速读档用固定热键
+HK_TOGGLE = 0xB0B1
+HK_QS_SAVE = 0xB0B2
+HK_QS_LOAD = 0xB0B3
+
 
 class MSG(ctypes.Structure):
     _fields_ = [
@@ -212,26 +217,60 @@ u32.GetMessageW.restype = ctypes.c_int
 u32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
 u32.PostThreadMessageW.restype = wt.BOOL
 
+# 窗口 / 输入（快速存档要用）
+u32.EnumWindows.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+u32.EnumWindows.restype = wt.BOOL
+u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.DWORD)]
+u32.GetClassNameW.argtypes = [ctypes.c_void_p, wt.LPWSTR, ctypes.c_int]
+u32.GetClientRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.RECT)]
+u32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.POINT)]
+u32.ClientToScreen.restype = wt.BOOL
+u32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.RECT)]
+u32.IsIconic.argtypes = [ctypes.c_void_p]
+u32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+u32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+u32.SetForegroundWindow.restype = wt.BOOL
+u32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+u32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+u32.keybd_event.argtypes = [wt.BYTE, wt.BYTE, wt.DWORD, ctypes.c_void_p]
+u32.mouse_event.argtypes = [wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_void_p]
+
 k32.GetCurrentThreadId.restype = wt.DWORD
 
 WM_QUIT = 0x0012
 
-_hotkey_state = {"name": None}
+MOD_CONTROL = 0x0002
+
+# 动作 -> (说明, [(修饰键, 键名, 虚拟键码)])
+HOTKEY_BINDINGS = [
+    ("toggle", "加速开关", [(0, "F8", 0x77), (0, "F12", 0x7B)]),
+    ("qs_save", "快速存档", [(0, "F5", 0x74)]),
+    ("qs_load", "快速读档", [(0, "F9", 0x78)]),
+    ("calib_exit", "校准·保存并退出", [(MOD_CONTROL, "Ctrl+F6", 0x75)]),
+    ("calib_confirm", "校准·确认", [(MOD_CONTROL, "Ctrl+F7", 0x76)]),
+    ("calib_resume", "校准·继续游戏", [(MOD_CONTROL, "Ctrl+F9", 0x78)]),
+    ("calib_resume2", "校准·继续游戏2", [(MOD_CONTROL, "Ctrl+F10", 0x79)]),
+]
+_hotkey_state = {"bound": {}}
 
 
-def register_toggle_hotkey():
-    """注册一个全局开关热键，返回键名（失败返回 None）。"""
-    for name, vk in HOTKEY_CANDIDATES:
-        if u32.RegisterHotKey(None, HOTKEY_ID, MOD_NOREPEAT, vk):
-            _hotkey_state["name"] = name
-            return name
-    return None
+def register_hotkeys():
+    """注册全部全局热键，返回 {动作: (键名, id)}。"""
+    bound = {}
+    for idx, (action, _label, cands) in enumerate(HOTKEY_BINDINGS):
+        hid = 0xB0B1 + idx
+        for mods, name, vk in cands:
+            if u32.RegisterHotKey(None, hid, mods | MOD_NOREPEAT, vk):
+                bound[action] = (name, hid)
+                break
+    _hotkey_state["bound"] = bound
+    return bound
 
 
-def unregister_toggle_hotkey():
-    if _hotkey_state["name"]:
-        u32.UnregisterHotKey(None, HOTKEY_ID)
-        _hotkey_state["name"] = None
+def unregister_hotkeys():
+    for _action, (_name, hid) in _hotkey_state.get("bound", {}).items():
+        u32.UnregisterHotKey(None, hid)
+    _hotkey_state["bound"] = {}
 
 
 def hotkey_worker(out_queue):
@@ -239,20 +278,21 @@ def hotkey_worker(out_queue):
 
     RegisterHotKey 把热键消息投递到"注册它的那个线程"的消息队列，所以必须在
     自己的线程里注册 + GetMessage；这样也不会和 tkinter (Tcl) 的消息循环打架。
-    收到按键就往队列里放一个 "toggle"，由界面线程安全地处理。
+    收到按键就往队列里放动作名，由界面线程安全地处理。
     """
     tid = k32.GetCurrentThreadId()
-    name = register_toggle_hotkey()
-    out_queue.put(("key", name))
-    if not name:
+    bound = register_hotkeys()
+    out_queue.put(("keys", bound))
+    if not bound:
         return
+    id2action = {hid: action for action, (_n, hid) in bound.items()}
     msg = MSG()
     try:
         while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
-                out_queue.put(("toggle", tid))
+            if msg.message == WM_HOTKEY and msg.wParam in id2action:
+                out_queue.put((id2action[msg.wParam], tid))
     finally:
-        unregister_toggle_hotkey()
+        unregister_hotkeys()
 k32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 k32.GetModuleHandleW.restype = wt.HMODULE
 k32.GetProcAddress.argtypes = [wt.HMODULE, wt.LPCSTR]
@@ -1616,6 +1656,269 @@ class SaveEditor:
 # 图形界面
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# 快速存档 / 快速读档
+# --------------------------------------------------------------------------
+# 游戏只在「保存并退出」时写盘（生成 exitsave_1）。所以做法是：
+#   存档 = 让游戏写一次盘 → 把整份存档目录快照下来
+#   读档 = 把某份快照盖回去 → 重启游戏并进入角色
+
+SNAP_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Stoneshard_Snapshots")
+QS_CONFIG = os.path.join(SNAP_ROOT, "config.json")
+
+
+def game_hwnd(pid=None):
+    """找游戏主窗口句柄（类名 YYGameMakerYY / 标题 Stoneshard）。"""
+    pid = pid or find_pid()
+    if not pid:
+        return None
+    res = []
+    CB = ctypes.WINFUNCTYPE(wt.BOOL, ctypes.c_void_p, ctypes.c_void_p)
+
+    def cb(hwnd, _lp):
+        p = wt.DWORD()
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if p.value == pid:
+            buf = ctypes.create_unicode_buffer(256)
+            u32.GetClassNameW(hwnd, buf, 256)
+            if buf.value.startswith("YYGameMaker"):
+                res.append(hwnd)
+        return True
+
+    u32.EnumWindows(CB(cb), None)
+    return res[0] if res else None
+
+
+def window_rect(hwnd):
+    r = wt.RECT()
+    u32.GetClientRect(hwnd, ctypes.byref(r))
+    top_left = wt.POINT(0, 0)
+    u32.ClientToScreen(hwnd, ctypes.byref(top_left))
+    return top_left.x, top_left.y, r.right, r.bottom
+
+
+def focus_window(hwnd):
+    if u32.IsIconic(hwnd):
+        u32.ShowWindow(hwnd, 9)      # SW_RESTORE
+    u32.SetForegroundWindow(hwnd)
+    time.sleep(0.3)
+
+
+def send_key(vk, hold=0.05):
+    u32.keybd_event(vk, 0, 0, 0)
+    time.sleep(hold)
+    u32.keybd_event(vk, 0, 2, 0)
+
+
+def click_at(x, y):
+    u32.SetCursorPos(int(x), int(y))
+    time.sleep(0.1)
+    u32.mouse_event(0x0002, 0, 0, 0, 0)     # LEFTDOWN
+    time.sleep(0.06)
+    u32.mouse_event(0x0004, 0, 0, 0, 0)     # LEFTUP
+
+
+class QuickSave:
+    """快照 / 回档 + 半自动触发游戏存档。"""
+
+    def __init__(self, log=None, keep=25):
+        self.log = log or (lambda m: None)
+        self.keep = keep
+        os.makedirs(SNAP_ROOT, exist_ok=True)
+
+    # ---------- 配置（按钮相对坐标，用于自动点菜单） ----------
+
+    def load_config(self):
+        try:
+            with open(QS_CONFIG, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save_config(self, cfg):
+        with open(QS_CONFIG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=1)
+
+    def calibrate(self, name):
+        """把鼠标当前位置记成某个按钮的位置（相对窗口的 0~1 比例）。"""
+        hwnd = game_hwnd()
+        if not hwnd:
+            raise RuntimeError("没找到游戏窗口，先把游戏开起来")
+        ox, oy, w, h = window_rect(hwnd)
+        pt = wt.POINT()
+        u32.GetCursorPos(ctypes.byref(pt))
+        rx = (pt.x - ox) / max(1, w)
+        ry = (pt.y - oy) / max(1, h)
+        cfg = self.load_config()
+        cfg[name] = [round(rx, 4), round(ry, 4)]
+        cfg["ref_size"] = [w, h]
+        self.save_config(cfg)
+        self.log("已记录 %s = 窗口内 %.1f%% / %.1f%%（窗口 %dx%d）"
+                 % (name, rx * 100, ry * 100, w, h))
+        return cfg[name]
+
+    def _click_named(self, name):
+        cfg = self.load_config()
+        if name not in cfg:
+            raise RuntimeError("还没校准「%s」的位置（用 --qs-calib %s）" % (name, name))
+        hwnd = game_hwnd()
+        if not hwnd:
+            raise RuntimeError("游戏没在运行")
+        ox, oy, w, h = window_rect(hwnd)
+        rx, ry = cfg[name]
+        click_at(ox + rx * w, oy + ry * h)
+
+    # ---------- 快照 ----------
+
+    def snapshot(self, tag="手动"):
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        name = "%s_%s" % (stamp, tag)
+        dst = os.path.join(SNAP_ROOT, name)
+        os.makedirs(dst, exist_ok=True)
+        for item in ("characters_v1", "characters.map"):
+            src = os.path.join(SAVE_ROOT, item)
+            if os.path.isdir(src):
+                shutil.copytree(src, os.path.join(dst, item))
+            elif os.path.isfile(src):
+                shutil.copy2(src, dst)
+        self.prune()
+        self.log("已建立临时存档：%s" % name)
+        return name
+
+    def list_snapshots(self):
+        if not os.path.isdir(SNAP_ROOT):
+            return []
+        out = []
+        for n in sorted(os.listdir(SNAP_ROOT), reverse=True):
+            p = os.path.join(SNAP_ROOT, n)
+            if os.path.isdir(p) and os.path.isdir(os.path.join(p, "characters_v1")):
+                out.append((n, p, os.path.getmtime(p)))
+        return out
+
+    def prune(self):
+        snaps = self.list_snapshots()
+        for name, path, _t in snaps[self.keep:]:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def restore(self, name):
+        src = os.path.join(SNAP_ROOT, name, "characters_v1")
+        if not os.path.isdir(src):
+            raise RuntimeError("找不到临时存档 %s" % name)
+        if find_pid():
+            self.kill_game()
+        dst = CHARS_DIR
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        extra = os.path.join(SNAP_ROOT, name, "characters.map")
+        if os.path.isfile(extra):
+            shutil.copy2(extra, os.path.join(SAVE_ROOT, "characters.map"))
+        self.log("已还原临时存档：%s" % name)
+
+    # ---------- 游戏进程 ----------
+
+    def kill_game(self, wait=15):
+        pids = []
+        for name in ("StoneShard.exe",):
+            pid = find_pid(name)
+            if pid:
+                pids.append(pid)
+        if not pids:
+            return False
+        for pid in pids:
+            h = k32.OpenProcess(0x0001, False, pid)      # PROCESS_TERMINATE
+            if h:
+                k32.TerminateProcess(h, 0)
+                k32.CloseHandle(h)
+        self.log("已关闭游戏进程")
+        t0 = time.time()
+        while time.time() - t0 < wait and find_pid():
+            time.sleep(0.5)
+        return True
+
+    def launch_game(self):
+        os.startfile(RUN_URL)
+        self.log("已请求 Steam 启动游戏…")
+
+    def wait_save_written(self, timeout=30):
+        """等游戏把存档写到盘上（exitsave/autosave 出现或更新）。"""
+        t0 = time.time()
+        newest = self.newest_mtime()
+        while time.time() - t0 < timeout:
+            if self.newest_mtime() > newest + 0.5:
+                return True
+            time.sleep(0.5)
+        return False
+
+    def newest_mtime(self):
+        newest = 0.0
+        for root, _dirs, files in os.walk(CHARS_DIR):
+            for f in files:
+                if f.endswith((".sav", ".map")):
+                    try:
+                        newest = max(newest, os.path.getmtime(os.path.join(root, f)))
+                    except OSError:
+                        pass
+        return newest
+
+    # ---------- 一键操作 ----------
+
+    def quicksave(self, tag="F5"):
+        """让游戏写一次盘（走「保存并退出」），再把存档目录快照下来。"""
+        if not find_pid():
+            raise RuntimeError("游戏没在运行，先进游戏里玩")
+        hwnd = game_hwnd()
+        if not hwnd:
+            raise RuntimeError("没找到游戏窗口")
+        cfg = self.load_config()
+        focus_window(hwnd)
+        send_key(0x1B)                      # Esc 打开菜单
+        time.sleep(0.6)
+        if "exit_btn" in cfg:
+            self._click_named("exit_btn")
+            time.sleep(0.8)
+        if "confirm_btn" in cfg:
+            self._click_named("confirm_btn")
+        if not self.wait_save_written(timeout=30):
+            raise RuntimeError(
+                "没等到游戏写盘。请先校准菜单按钮："
+                "把鼠标移到「保存并退出」上执行 --qs-calib exit_btn，"
+                "移到确认按钮上执行 --qs-calib confirm_btn")
+        name = self.snapshot(tag)
+        time.sleep(1.5)
+        if "resume_btn" in cfg:
+            self._click_named("resume_btn")     # 回到游戏
+            time.sleep(1.0)
+            if "resume_btn2" in cfg:
+                self._click_named("resume_btn2")
+        return name
+
+    def quickload(self, name=None, boot_wait=45):
+        """把临时存档盖回去，然后重启游戏。"""
+        snaps = self.list_snapshots()
+        if not snaps:
+            raise RuntimeError("还没有任何临时存档")
+        if name is None:
+            name = snaps[0][0]
+        if find_pid():
+            self.kill_game()
+        self.restore(name)
+        self.launch_game()
+        cfg = self.load_config()
+        if "resume_btn" in cfg:
+            t0 = time.time()
+            while time.time() - t0 < boot_wait and not game_hwnd():
+                time.sleep(1.0)
+            time.sleep(12.0)                    # 等游戏启动到主菜单
+            hwnd = game_hwnd()
+            if hwnd:
+                focus_window(hwnd)
+                self._click_named("resume_btn")
+                time.sleep(1.0)
+                if "resume_btn2" in cfg:
+                    self._click_named("resume_btn2")
+        return name
+
 def respec_window(parent, log):
     """洗点窗口：列出所有角色存档，支持属性洗点和补技能点。"""
     import tkinter as tk
@@ -1851,6 +2154,8 @@ def run_gui(open_respec=False):
     root.minsize(480, 400)
 
     accel = Accelerator()
+    qs = QuickSave(log)
+    watch = {"last": qs.newest_mtime()}
     state = {"auto": tk.BooleanVar(value=True), "want": 1.5, "on": True}
 
     # ---- 日志 ----
@@ -1862,6 +2167,44 @@ def run_gui(open_respec=False):
         logbox.configure(state="disabled")
 
     accel.log = log
+
+    def do_quicksave():
+        log("快速存档：让游戏写盘并快照…（期间别动鼠标）")
+        try:
+            name = qs.quicksave()
+            watch["last"] = qs.newest_mtime()
+            log("已生成临时存档：%s" % name)
+        except Exception as exc:
+            log("快速存档失败：%s" % exc)
+
+    def do_quickload():
+        try:
+            name = qs.quickload()
+            log("已回档到 %s，正在重新进入游戏…" % name)
+        except Exception as exc:
+            log("快速读档失败：%s" % exc)
+
+    CALIB_LABELS = {
+        "calib_exit": ("exit_btn", "「保存并退出」按钮"),
+        "calib_confirm": ("confirm_btn", "确认对话框的「确定」按钮"),
+        "calib_resume": ("resume_btn", "主菜单的「继续游戏」按钮"),
+        "calib_resume2": ("resume_btn2", "进入游戏后的第二个确认按钮（没有就不用校准）"),
+    }
+
+    def start_calibration(action):
+        key, label = CALIB_LABELS.get(action, (None, None))
+        if not key:
+            return
+
+        def record():
+            try:
+                qs.calibrate(key)
+                log("✔ 已记录%s的位置" % label)
+            except Exception as exc:
+                log("校准失败：%s" % exc)
+
+        log("3 秒后记录%s的位置，请把鼠标移过去别动…" % label)
+        root.after(3000, record)
 
     # ---- 全局开关热键（在独立线程里收）----
     hk_queue = queue.Queue()
@@ -2042,8 +2385,10 @@ def run_gui(open_respec=False):
     row2.pack(fill="x")
     ttk.Button(row2, text="洗点 / 改存档", width=16,
                command=lambda: respec_window(root, log)).pack(side="left")
-    ttk.Label(row2, text="（改存档需要先完全退出游戏）",
-              foreground="#888888").pack(side="left", padx=8)
+    ttk.Button(row2, text="快速存档 (F5)", width=14,
+               command=do_quicksave).pack(side="left", padx=(10, 0))
+    ttk.Button(row2, text="快速读档 (F9)", width=14,
+               command=do_quickload).pack(side="left", padx=6)
 
     logbox = tk.Text(root, height=12, state="disabled", wrap="word",
                      bg="#111111", fg="#d0d0d0", font=("Consolas", 9))
@@ -2058,23 +2403,43 @@ def run_gui(open_respec=False):
                 kind, val = hk_queue.get_nowait()
             except queue.Empty:
                 break
-            if kind == "key":
-                if val:
-                    state["hotkey"] = val
-                    hk_var.set("快捷键 %s：开启 / 关闭加速（全局有效，游戏里也能按）"
-                               % val)
-                    log("快捷键已就绪：按 %s 开关加速。" % val)
+            if kind == "keys":
+                bound = val or {}
+                state["hotkey"] = bound.get("toggle", (None,))[0]
+                main = [a for a in ("qs_save", "qs_load", "toggle")]
+                parts = ["%s=%s" % (dict((x[0], x[1]) for x in HOTKEY_BINDINGS)[a],
+                                    bound[a][0]) for a in main if a in bound]
+                text = "、".join(parts) if parts else "注册失败（可能被别的软件占用）"
+                hk_var.set("快捷键：" + text)
+                log("快捷键已就绪：" + text)
+                if all(a in bound for a in ("calib_exit", "calib_confirm")):
+                    log("校准热键：Ctrl+F6=保存并退出按钮，Ctrl+F7=确认按钮，"
+                        "Ctrl+F9=继续游戏，Ctrl+F10=继续游戏(第二步)")
                 else:
-                    hk_var.set("快捷键注册失败（可能被其它软件占用了）")
-                    log("警告：F8~F11 都被占用了，全局快捷键没启用。")
+                    log("提示：校准热键被占用，可能录不到菜单按钮位置")
             elif kind == "toggle":
                 on_toggle()
+            elif kind == "qs_save":
+                do_quicksave()
+            elif kind == "qs_load":
+                do_quickload()
+            elif kind.startswith("calib_"):
+                start_calibration(kind)
         root.after(100, poll_hotkey_queue)
 
     def tick():
         refresh_status()
         if state["auto"].get() and not accel.attached and find_pid():
             do_attach(silent=True)
+        # 游戏一旦写盘（自己存盘或用了快速存档模组），自动留一份快照
+        m = qs.newest_mtime()
+        if m > watch["last"] + 0.5:
+            watch["last"] = m
+            try:
+                name = qs.snapshot("自动")
+                log("检测到游戏写盘，已自动留档：%s" % name)
+            except Exception as exc:
+                log("自动留档失败：%s" % exc)
         root.after(1500, tick)
 
     root.protocol("WM_DELETE_WINDOW", on_quit)
@@ -2141,11 +2506,58 @@ def main(argv=None):
                     help="列出该地址附近出现的角色已知数值（用来找属性字段）")
     ap.add_argument("--mem-score", action="store_true",
                     help="给上次扫描的候选打分：附近出现的角色已知数值越多越像真身")
+    ap.add_argument("--qs-shot", nargs="?", const="手动", metavar="标签",
+                    help="立刻把当前存档目录快照成一份临时存档")
+    ap.add_argument("--qs-list", action="store_true", help="列出所有临时存档")
+    ap.add_argument("--qs-restore", nargs="?", const="", metavar="名字",
+                    help="把临时存档盖回存档目录（省略名字=最近一份）")
+    ap.add_argument("--qs-save", action="store_true",
+                    help="快速存档：自动点游戏菜单写盘，然后快照")
+    ap.add_argument("--qs-load", nargs="?", const="", metavar="名字",
+                    help="快速读档：还原临时存档并重启游戏")
+    ap.add_argument("--qs-calib", metavar="按钮名",
+                    help="把鼠标当前位置记成按钮坐标（exit_btn/confirm_btn/resume_btn/resume_btn2）")
     args = ap.parse_args(argv)
 
     log = lambda m: print(m, flush=True)
 
     # ---------- 内存方式（不碰存档） ----------
+    if args.qs_list:
+        qs = QuickSave(log)
+        snaps = qs.list_snapshots()
+        if not snaps:
+            print("还没有临时存档。目录：%s" % SNAP_ROOT)
+        for name, path, mtime in snaps:
+            print("   %-28s %s" % (name, time.strftime("%m-%d %H:%M:%S",
+                                                      time.localtime(mtime))))
+        return 0
+
+    if args.qs_shot:
+        qs = QuickSave(log)
+        qs.snapshot(args.qs_shot or "手动")
+        return 0
+
+    if args.qs_restore is not None:
+        qs = QuickSave(log)
+        name = args.qs_restore or None
+        qs.restore(name or qs.list_snapshots()[0][0])
+        return 0
+
+    if args.qs_calib:
+        qs = QuickSave(log)
+        qs.calibrate(args.qs_calib)
+        return 0
+
+    if args.qs_save:
+        qs = QuickSave(log)
+        qs.quicksave()
+        return 0
+
+    if args.qs_load is not None:
+        qs = QuickSave(log)
+        qs.quickload(args.qs_load or None)
+        return 0
+
     if args.mem_find is not None:
         val = float(args.mem_find)
         loc = AttrLocator(log=log)
